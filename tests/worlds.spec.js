@@ -13,7 +13,8 @@ function targetUrl(){
  if(!value) throw new Error('Set PULSAI_TEST_URL to an authorized preview or public deployment URL.');
  const u=new URL(value); u.pathname='/explore.html'; return u.toString();
 }
-test('capture all 16 worlds and verify GLB imports',async ({page},testInfo)=>{\n test.setTimeout(480000);
+test('capture all 16 worlds and verify GLB imports',async ({page},testInfo)=>{
+ test.setTimeout(480000);
  const failures=[],results=[],pageErrors=[];
  page.on('pageerror',e=>pageErrors.push(e.message));
  await page.goto(targetUrl(),{waitUntil:'domcontentloaded'});
