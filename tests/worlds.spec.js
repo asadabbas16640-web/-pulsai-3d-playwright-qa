@@ -26,10 +26,10 @@ test('capture all 16 worlds and verify GLB imports',async ({page},testInfo)=>{\n
   try {await page.waitForFunction(i=>{const q=window.__PULSAI_QA__;return q?.worldIndex===i && q.requested===q.loaded+q.failed},i,{timeout:20000});}
   catch(e){timedOut=true;}
   const qa=await page.evaluate(()=>structuredClone(window.__PULSAI_QA__));
+  const problems=[];
   const shot=`${String(i+1).padStart(2,'0')}-${testInfo.project.name}.png`;
   try { await page.screenshot({path:testInfo.outputPath(shot),fullPage:false,animations:'disabled',timeout:12000}); } catch(e) { problems.push('Screenshot failed: '+e.message); }
   if(fs.existsSync(testInfo.outputPath(shot))) await testInfo.attach(shot,{path:testInfo.outputPath(shot),contentType:'image/png'});
-  const problems=[];
   if(timedOut) problems.push('Asset loading timed out');
   if(qa.worldIndex!==i) problems.push(`Wrong world index ${qa.worldIndex}`);
   if(GLB_WORLDS.has(i)&&qa.requested===0) problems.push('No GLB requested');
