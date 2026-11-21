@@ -2,30 +2,77 @@ name: PulsAI 3D Playwright QA
 on:
   workflow_dispatch:
   push:
+    branches: [main]
     paths:
       - 'tests/**'
       - 'playwright.config.js'
-      - 'package.json'
+      - 'package*.json'
       - '.github/workflows/playwright.yml'
+permissions:
+  contents: read
 jobs:
   browser-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    env:
-      PULSAI_TEST_URL: ${{ secrets.PULSAI_TEST_URL }}
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [desktop-chromium, s24-ultra-viewport]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: npm install --no-audit --no-fund
-      - run: npx playwright install --with-deps chromium
-      - run: npm test
-      - uses: actions/upload-artifact@v4
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npx playwright test --list
+      - run: npx playwright install --with-deps --only-shell chromium
+      - name: Run private preview QA
+        env:
+          PULSAI_TEST_URL: ${{ secrets.PULSAI_TEST_URL }}
+          QA_PROFILE: ${{ matrix.profile }}
+        run: |
+          if [ -z "$PULSAI_TEST_URL" ]; then
+            echo "::error::PULSAI_TEST_URL is missing."
+            exit 1
+          fi
+          status=0
+          npm test -- --project="$QA_PROFILE" >qa-run.log 2>&1 || status=$?
+          node <<'JS'
+          const fs = require('node:fs');
+          const profile = process.env.QA_PROFILE;
+          const path = 'test-results/worlds-inspect-all-16-environments-' + profile + '/asset-report.json';
+          const report = fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, 'utf8')) : {};
+          const results = report.results ?? [];
+          const summary = [
+            '### ' + profile,
+            '- Worlds inspected: ' + results.length + '/16',
+            '- Screenshots captured: ' + results.filter(result => result.screenshot).length + '/16',
+            '- Worlds passed: ' + results.filter(result => result.pass).length + '/16',
+            ...(report.preflight ? ['- Preview access or scene startup failed before world inspection.'] : []),
+            ''
+          ];
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary.join('\n') + '\n');
+          if (report.preflight) console.log('Preview access or scene startup failed before world inspection.');
+          JS
+          exit "$status"
+      - name: Encrypt private reports and screenshots
+        id: archive
         if: always()
+        env:
+          QA_ARTIFACT_PASSPHRASE: ${{ secrets.PULSAI_QA_ARTIFACT_PASSPHRASE }}
+        run: |
+          if [ -z "$QA_ARTIFACT_PASSPHRASE" ] || [ ! -d test-results ]; then
+            echo "Private report archive was skipped. Configure PULSAI_QA_ARTIFACT_PASSPHRASE to enable it." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          tar -czf - playwright-report test-results qa-run.log |
+            gpg --batch --pinentry-mode loopback --passphrase-fd 3 --symmetric --cipher-algo AES256               --output private-qa.tar.gz.gpg 3<<<"$QA_ARTIFACT_PASSPHRASE"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.archive.outputs.ready == 'true'
         with:
-          name: pulsai-3d-playwright-results
-          path: |
-            playwright-report/
-            test-results/
+          name: pulsai-private-qa-${{ matrix.profile }}
+          path: private-qa.tar.gz.gpg
           retention-days: 14
+          if-no-files-found: error

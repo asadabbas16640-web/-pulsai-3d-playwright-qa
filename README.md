@@ -20,3 +20,10 @@ The test visits all 16 worlds on desktop and Samsung S24 Ultra-sized emulated mo
 
 ## Limitations
 Hatchable project visibility is personal/private; the ordinary URL is blocked by a platform sign-in wall. A 30-minute preview token is unsuitable for recurring unattended runs. Use a durable authorized access solution for recurring CI. Emulated mobile is not physical-device testing.
+
+The workflow runs both profiles independently and posts only coverage counts to
+the public run summary. Set a strong, independently generated
+`PULSAI_QA_ARTIFACT_PASSPHRASE` repository secret to retain the encrypted HTML
+and JSON reports, logs, and screenshots. Download the profile artifact and run
+`gpg --decrypt private-qa.tar.gz.gpg | tar -xz` in a private directory. GPG
+prompts for the passphrase. Keep the decrypted reports private.

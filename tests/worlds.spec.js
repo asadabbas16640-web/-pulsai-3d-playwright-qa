@@ -8,47 +8,163 @@ const WORLD_NAMES = [
  'AI Intelligence Sphere','Integrated Clinical Workstations','Emergency Operations Campus'
 ];
 const GLB_WORLDS = new Set([4,8,11,12,14]);
-function targetUrl(){
- const value=process.env.PULSAI_TEST_URL;
- if(!value) throw new Error('Set PULSAI_TEST_URL to an authorized preview or public deployment URL.');
- const u=new URL(value); u.pathname='/explore.html'; return u.toString();
+
+const timeout = 12000;
+
+function targetUrl() {
+  const value = process.env.PULSAI_TEST_URL;
+  if (!value) throw new Error('PULSAI_TEST_URL is missing');
+  const url = new URL(value);
+  if (url.origin !== 'https://pulsai-beyond-the.hatchable.site') {
+    throw new Error('PULSAI_TEST_URL must use the authorized PulsAI 3D origin');
+  }
+  // Preserve the complete preview URL, including any authentication path.
+  return url;
 }
-test('capture all 16 worlds and verify GLB imports',async ({page},testInfo)=>{
- test.setTimeout(480000);
- const failures=[],results=[],pageErrors=[];
- page.on('pageerror',e=>pageErrors.push(e.message));
- await page.goto(targetUrl(),{waitUntil:'domcontentloaded'});
- await expect(page.locator('#stage')).toBeVisible();
- await page.waitForFunction(()=>window.__PULSAI_QA__?.ready===true,null,{timeout:30000});
- for(let i=0;i<WORLD_NAMES.length;i++){
-  if(i>0) await page.locator('#next').dispatchEvent('click');
-  await expect(page.locator('#worldTitle')).toHaveText(WORLD_NAMES[i]);
-  let timedOut=false;
-  try {await page.waitForFunction(i=>{const q=window.__PULSAI_QA__;return q?.worldIndex===i && q.requested===q.loaded+q.failed},i,{timeout:20000});}
-  catch(e){timedOut=true;}
-  const qa=await page.evaluate(()=>structuredClone(window.__PULSAI_QA__));
-  const problems=[];
-  const shot=`${String(i+1).padStart(2,'0')}-${testInfo.project.name}.png`;
-  try { await page.screenshot({path:testInfo.outputPath(shot),fullPage:false,animations:'disabled',timeout:12000}); } catch(e) { problems.push('Screenshot failed: '+e.message); }
-  if(fs.existsSync(testInfo.outputPath(shot))) await testInfo.attach(shot,{path:testInfo.outputPath(shot),contentType:'image/png'});
-  if(timedOut) problems.push('Asset loading timed out');
-  if(qa.worldIndex!==i) problems.push(`Wrong world index ${qa.worldIndex}`);
-  if(GLB_WORLDS.has(i)&&qa.requested===0) problems.push('No GLB requested');
-  if(GLB_WORLDS.has(i)&&qa.loaded===0) problems.push('No GLB loaded');
-  if(qa.failed>0) problems.push(`${qa.failed} failed GLBs: ${qa.errors.join(' | ')}`);
-  if(problems.length) failures.push(`${i+1} ${WORLD_NAMES[i]}: ${problems.join('; ')}`);
-  results.push({world:i+1,name:WORLD_NAMES[i],...qa,problems});
- }
- const report=JSON.stringify({device:testInfo.project.name,results,pageErrors,failures},null,2);
- fs.writeFileSync(testInfo.outputPath('asset-report.json'),report);
- await testInfo.attach('asset-report.json',{body:report,contentType:'application/json'});
- expect(failures.concat(pageErrors),'See asset-report.json and screenshots').toEqual([]);
+
+function assetUrl(value) {
+  const url = new URL(value);
+  return url.origin + url.pathname;
+}
+
+async function openScene(page) {
+  const url = targetUrl();
+  const response = await page.goto(url.href, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  if (!response?.ok() || new URL(page.url()).origin !== url.origin) {
+    throw new Error('Preview access failed (HTTP ' + (response?.status() ?? 'unknown') + ')');
+  }
+  if (new URL(page.url()).pathname === '/') {
+    const explore = new URL('/explore.html', url.origin);
+    explore.search = url.search;
+    const scene = await page.goto(explore.href, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    if (!scene?.ok() || new URL(page.url()).origin !== url.origin) {
+      throw new Error('Explorer access failed (HTTP ' + (scene?.status() ?? 'unknown') + ')');
+    }
+  }
+  await page.locator('#stage').waitFor({ state: 'visible', timeout });
+  await page.waitForFunction(() => window.__PULSAI_QA__?.ready, null, { timeout: 25000 });
+}
+
+async function activate(locator, touch) {
+  if (touch) await locator.tap({ timeout });
+  else await locator.click({ timeout });
+}
+
+test('inspect all 16 environments', async ({ page, isMobile }, testInfo) => {
+  test.setTimeout(18 * 60 * 1000);
+  let world;
+  const diagnostics = [];
+  const network = new Map();
+  const results = [];
+  const report = { device: testInfo.project.name, results, diagnostics };
+  const writeReport = () => fs.writeFileSync(
+    testInfo.outputPath('asset-report.json'), JSON.stringify(report, null, 2)
+  );
+
+  page.on('pageerror', error => diagnostics.push({ world, type: 'runtime', message: error.message }));
+  page.on('console', message => {
+    if (['error', 'warning'].includes(message.type())) {
+      diagnostics.push({ world, type: message.type(), message: message.text() });
+    }
+  });
+  const record = (request, outcome) => {
+    const url = new URL(request.url());
+    if (!/\.(glb|gltf|bin)$/i.test(url.pathname)) return;
+    const entry = network.get(request) ?? { world, url: assetUrl(request.url()) };
+    Object.assign(entry, outcome);
+    network.set(request, entry);
+  };
+  page.on('request', request => record(request, { status: 'pending' }));
+  page.on('response', response => record(response.request(), { status: response.status() }));
+  page.on('requestfailed', request => record(request, { status: request.failure()?.errorText }));
+
+  try {
+    await openScene(page);
+  } catch (error) {
+    report.preflight = error.message;
+    writeReport();
+    throw new Error('Explorer preflight failed. See the private QA report for details.');
+  }
+
+  const title = page.locator('#worldTitle');
+  const menu = page.locator('#worlds');
+  const items = page.locator('#worldList button');
+  let verifiedIndex = 0;
+  for (const [index, name] of WORLD_NAMES.entries()) {
+    world = index + 1;
+    const result = { world, name, navigation: false, screenshot: false, problems: [] };
+    results.push(result);
+    try {
+      if (index > 0 && verifiedIndex === index - 1) {
+        try {
+          await activate(page.locator('#next'), isMobile);
+          await expect(title).toHaveText(name, { timeout });
+          result.navigation = true;
+        } catch (error) {
+          result.problems.push('Next control: ' + error.message);
+        }
+      }
+      if (index > 0 && !result.navigation) {
+        if (!(await menu.evaluate(element => element.classList.contains('open')))) {
+          await activate(page.locator('#menuBtn'), isMobile);
+        }
+        await expect(items).toHaveCount(16, { timeout });
+        await activate(items.nth(index), isMobile);
+        result.recoveredThroughMenu = true;
+      }
+      await expect(title).toHaveText(name, { timeout });
+      if (index === 0) result.navigation = true;
+      verifiedIndex = index;
+
+      try {
+        await page.waitForFunction(index => {
+          const qa = window.__PULSAI_QA__;
+          return qa?.worldIndex === index && qa.requested === qa.loaded + qa.failed;
+        }, index, { timeout: 20000, polling: 250 });
+      } catch {
+        result.problems.push('Asset loading timed out');
+      }
+
+      const { qa, webgl } = await page.evaluate(() => {
+        const canvas = document.querySelector('#stage');
+        const context = canvas?.getContext('webgl2') ?? canvas?.getContext('webgl');
+        return {
+          qa: structuredClone(window.__PULSAI_QA__),
+          webgl: !!context && !context.isContextLost() && context.drawingBufferWidth > 0
+        };
+      });
+      Object.assign(result, { webgl, assets: qa });
+      if (!webgl) result.problems.push('WebGL drawing buffer is unavailable');
+      if (GLB_WORLDS.has(index) && (!qa.requested || !qa.loaded)) {
+        result.problems.push('Expected imported model did not load');
+      }
+      if (qa.failed) result.problems.push(qa.failed + ' model imports failed');
+      const screenshot = String(world).padStart(2, '0') + '-' + testInfo.project.name + '.png';
+      await page.screenshot({ path: testInfo.outputPath(screenshot), scale: 'css', timeout: 18000 });
+      result.screenshot = true;
+      await testInfo.attach(screenshot, { path: testInfo.outputPath(screenshot), contentType: 'image/png' });
+    } catch (error) {
+      result.problems.push(error.message);
+    }
+    result.assetRequests = [...network.values()].filter(entry => entry.world === world);
+    result.browserErrors = diagnostics.filter(entry => entry.world === world);
+    result.pass = result.problems.length === 0 &&
+      !result.browserErrors.some(entry => ['error', 'runtime'].includes(entry.type));
+    writeReport();
+  }
+
+  expect(results.filter(result => !result.pass).map(result => result.world)).toEqual([]);
+  expect(diagnostics.filter(entry => !entry.world && ['error', 'runtime'].includes(entry.type)).length).toBe(0);
 });
-test('menu has 16 clickable worlds',async ({page})=>{
- await page.goto(targetUrl(),{waitUntil:'domcontentloaded'});
- await page.waitForFunction(()=>window.__PULSAI_QA__?.ready===true,null,{timeout:30000});
- await page.locator('#menuBtn').click();
- await expect(page.locator('#worldList button')).toHaveCount(16);
- await page.locator('#worldList button').nth(11).click();
- await expect(page.locator('#worldTitle')).toHaveText(WORLD_NAMES[11]);
+
+test('world menu and previous control accept device input', async ({ page, isMobile }) => {
+  await openScene(page);
+  await activate(page.locator('#menuBtn'), isMobile);
+  const items = page.locator('#worldList button');
+  await expect(items).toHaveCount(16);
+  await activate(items.nth(12), isMobile);
+  await expect(page.locator('#worldTitle')).toHaveText(WORLD_NAMES[12]);
+  await expect(page.locator('#worlds')).not.toHaveClass(/\bopen\b/);
+  await activate(page.locator('#prev'), isMobile);
+  await expect(page.locator('#worldTitle')).toHaveText(WORLD_NAMES[11]);
 });
